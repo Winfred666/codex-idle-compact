@@ -1,0 +1,12 @@
+{
+  "name": "codex-idle-compact",
+  "plugins": [
+    {
+      "name": "codex-idle-compact",
+      "source": {
+        "source": "local",
+        "path": "./"
+      }
+    }
+  ]
+}

@@ -2,95 +2,71 @@
 
 [![CI](https://github.com/Winfred666/codex-idle-compact/actions/workflows/ci.yml/badge.svg)](https://github.com/Winfred666/codex-idle-compact/actions/workflows/ci.yml)
 
-**Status: incomplete observer preview. This implementation deliberately disables automatic compaction.**
+A small Codex plugin that **automatically runs native compaction after 20 minutes idle**, when the latest completed turn uses **at least 40% of the effective context window**.
 
-The intended behavior is native compaction after a completed turn, at least **40% active context**, and **20 minutes of inactivity**. Research found a blocking race: Codex's `thread/compact/start` can abort an active turn, and accepts no atomic idle precondition. Checking status just before calling it cannot guarantee that new work is safe.
-
-This release ships a runtime diagnostic and an idle observer for an existing App Server connection. **It never initiates compaction because the trigger was not implemented.** Codex does expose native compaction; this project's original strict requirement to never interrupt active work cannot be guaranteed by an external idle check followed by that call. The observer does not fulfill the automatic-compaction goal. See [verified findings](docs/research.md) and [architecture](docs/architecture.md).
-
-Installing this Python package also does not register lifecycle hooks or start a watcher. There is no automatic enable switch in this preview. An enabled-by-default plugin would need startup integration plus either best-effort idle checks with a remaining interruption race, or a native guarded-compaction operation. Plugin hooks additionally require Codex's normal trust review.
+**Enabled when installed.** Trusted lifecycle hooks start one local watcher automatically. No separate enable command, background-service setup, API key, or pip install. Supports Linux and macOS, including installation on an SSH runtime host. Requires `python3` 3.9+ and a daemon-backed Codex session with an accessible owning Unix socket. Tested with Codex CLI 0.162.1.
 
 ## Install
 
-Requires Python 3.9+, Linux or macOS, and an installed Codex CLI. One runtime dependency (`websockets`) handles the native Unix-socket transport. No database, service, API key, or model calls.
-
 ```sh
-pipx install git+https://github.com/Winfred666/codex-idle-compact.git
-codex-idle-compact doctor
+codex plugin marketplace add Winfred666/codex-idle-compact
+codex plugin add codex-idle-compact@codex-idle-compact
 ```
 
-Or run the diagnostic directly, with no package installation (the proxy requires `pip install .`):
+Complete Codex's normal hook trust review if prompted. Start your next session normally; existing sessions may need a new session to load the hooks. **Installation does not restart anything.** A standard TUI using the shared local daemon is supported; `--no-daemon` / embedded mode and stdio-only desktop sessions cannot be attached through this plugin. Unsupported sessions receive a SessionStart hint.
 
-```sh
-git clone https://github.com/Winfred666/codex-idle-compact.git
-cd codex-idle-compact
-python3 codex_idle_compact.py doctor
-```
+For SSH, run these commands on the machine running Codex, with that runtime's `CODEX_HOME`. The plugin stays on that host and uses its local socket.
 
-`doctor` generates the installed binary's protocol schema in a temporary directory. It prints the version, compaction request fields, and limitation; **exit code 2 is expected** because safe automatic compaction is unsupported. It does not start a server or access conversation history. Unknown versions remain unsupported until their semantics have been reviewed.
+## Configuration
 
-## Observe an existing server
-
-For an App Server client that lets you configure its stdio server command, use:
-
-```sh
-codex-idle-compact proxy \
-  --socket /absolute/path/to/owning-app-server.sock \
-  --idle-minutes 20
-```
-
-Configuration example for such a client's process launcher:
+Defaults work without a configuration file. To change the inactivity interval, save this as `$CODEX_HOME/codex-idle-compact.json` (normally `~/.codex/codex-idle-compact.json`):
 
 ```json
-{
-  "command": "codex-idle-compact",
-  "args": ["proxy", "--socket", "/absolute/path/to/owning-app-server.sock", "--idle-minutes", "50"]
-}
+{"idleMinutes": 50}
 ```
 
-This JSON describes a process launch, **not a Codex `config.toml` setting**. Use `60` or any positive finite number of minutes instead of `50`. `doctor --codex /path/to/codex` selects the binary to inspect.
+Use `60`, `20`, or another positive number of minutes. Changes are picked up automatically. Threshold stays at 40%; cooldown equals the configured idle interval.
 
-The socket must already belong to the server owning the target threads. The companion connects directly using Codex's native WebSocket-over-Unix-socket protocol. It launches no subprocess while observing. It never runs `thread/start`, `thread/resume`, or a new App Server itself. Your client retains responsibility for initializing its connection and subscribing to its own threads. The companion preserves JSON payloads and translates only transport framing between stdio JSONL and WebSocket messages.
+The default owner endpoint is `$CODEX_HOME/app-server-control/app-server-control.sock`. For a runtime using another Unix socket, add `"socket": "/absolute/path/to/owner.sock"`. The hook verifies the kernel-reported socket owner is an ancestor of its process; merely pointing at another running daemon does not work. The plugin never starts a server to load an existing chat.
 
-The usual shared-daemon socket is `$CODEX_HOME/app-server-control/app-server-control.sock` (`~/.codex` is the default home); long paths may be relocated by Codex. Use the actual owner socket. Do not start another server to load a desktop chat for this purpose.
+Uninstall with:
 
-**This preview has no drop-in Desktop/TUI integration.** That is partly an implementation limitation: a stock TUI connected to a shared daemon can expose its owning server, but this preview has no independent watcher/subscription bootstrap for it. The proxy observes only threads already subscribed on the client connection routed through it. An embedded or already-running stdio-only server does not expose an attachable Unix endpoint. Hooks can help start a watcher and report submitted activity, but cannot supply the missing atomic compaction guard. This preview does not install a plugin, hooks, or global configuration.
-
-For SSH, install and run the companion on the runtime host, with that host's owner socket. A configurable local client can launch it through `ssh host codex-idle-compact proxy --socket ...`. Do not expose an unauthenticated network listener.
-
-## What the observer does
-
-- Requires a newly observed `turn/started`, a successful `turn/completed`, and explicit `idle` status. Historical replay alone never arms it.
-- Uses `tokenUsage.last.totalTokens / tokenUsage.modelContextWindow`; lifetime `total` is ignored. Cached input and reasoning tokens are not added again. Missing, negative, noninteger, inconsistent, or over-window data suppresses eligibility.
-- Cancels on observed client activity, new turns, active/error/unloaded status, tool starts, queue changes, or native compaction. Closure/archive/deletion forgets the thread. Every thread has separate state.
-- Rechecks its latest observed status and usage on expiry. It logs one `blocked` report per eligible completed turn, with a cooldown equal to the configured idle duration. A timer over 60 seconds late logs `skipped_late`.
-- Uses an OS lock to prevent duplicate observers for one endpoint. Disconnecting discards all timers. Restarting waits for a fresh turn.
-
-Example diagnostic on stderr, never on the protocol stdout:
-
-```json
-{"event":"blocked","threadId":"…","turnId":"…","usedTokens":40000,"contextWindow":100000,"idleSeconds":1200,"compactionStarted":false,"reason":"Automatic compaction is unavailable: the audited native API can replace an active turn and has no atomic idle/queue precondition."}
+```sh
+codex plugin remove codex-idle-compact@codex-idle-compact
 ```
 
-The preview does **not** claim that observation proves safety: it does not obtain an atomic snapshot of queues, background terminals, all clients, unsent typing, or pending automatic work. It never proceeds to a compaction request. It does not claim completion/failure monitoring for compactions it cannot safely initiate.
+## What runs
 
-Prompt-cache expiry is not exposed here. Twenty minutes is a policy default, not a measured TTL or guaranteed cost saving. Native compaction is lossy and may consume tokens if a future safe implementation becomes available. Existing Codex auto-compaction settings remain untouched.
+1. A trusted hook records only session/turn identifiers and activity. It starts one watcher, protected by an OS process lock.
+2. The watcher attaches to the same loaded session on its verified owning daemon. A matching `Stop` hook, successful `turn/completed`, and native `idle` status are all required.
+3. It calculates `tokenUsage.last.totalTokens / tokenUsage.modelContextWindow`. Lifetime totals are ignored; cached/reasoning tokens are not added twice. Missing, inconsistent, or ambiguous usage disarms the timer.
+4. Submitted user input, new turns, tools, queue changes, compaction, session closure, or disconnect cancel eligibility. Native/manual compaction never rearms itself; a new normal completed turn is required.
+5. At expiry, it rechecks usage, inactivity, latest turn, status, queued work, background terminals, goals, and active descendants. If eligible, it calls **`thread/compact/start`** and waits for the corresponding `contextCompaction` item **and** successful turn completion. An empty RPC acknowledgment is not success. Unknown outcomes are not automatically retried.
 
-## Develop
+Each session has separate state, a single-flight lock, and a cooldown. Sleep or a delayed watcher loop cancels pending timers. The watcher exits after its sessions disappear. Runtime files and a small rotating `watcher.log` live in Codex's `PLUGIN_DATA` directory; they contain identifiers and event names, not prompts or transcripts. One small BSD-licensed WebSocket wheel is bundled for installation without pip; application code is MIT.
+
+## Limits
+
+- **Idle checks are best effort.** Codex's public compact request has no atomic “only if still idle” guard. Input arriving between the final check and the request can be interrupted by native compaction. Unsubmitted composer typing is not exposed by hooks. This plugin cannot promise zero interference with active users; [research](docs/research.md) describes the exact API limitation.
+- Subscription uses `thread/resume` only after verifying the owner and an already-loaded thread. There is no public atomic loaded-only subscribe operation; an unload in that narrow gap is also possible. No separate Codex server/session is launched by the plugin.
+- Hook trust is required. Hosts without a reachable owning Unix endpoint are unsupported. Some TUI launch flags force embedded mode. Custom/very long home paths may require an explicit socket setting. Unknown required API responses skip compaction.
+- Prompt-cache expiry is not observable. Twenty minutes is a policy, not a TTL guarantee or a promise of savings. Native compaction can consume tokens and loses detail. Existing Codex automatic-compaction settings are untouched; a nonzero `model_post_turn_compact_threshold_percent` may still compact immediately, independently of this plugin.
+- Version 0.1 was an incomplete observer. **Version 0.2 implements the trigger and automatic hook startup.** It chooses practical idle checks while explicitly retaining the native race above.
+
+## Develop and verify
 
 ```sh
 python3 -m pip install .
 python3 -m unittest discover -s tests -v
-codex-idle-compact --version
 ```
 
-Tests cover threshold boundaries, ambiguous usage, event order, activity cancellation, tool execution, queues, duplicate events, cooldown/rearming, compaction suppression, multiple threads, process locks, and payload-preserving relay. CI runs on Linux/macOS with Python 3.9/3.13.
-
-Optional real transport smoke test (starts an empty isolated App Server, creates **no threads**, makes **no model calls**):
+Run the native integration test against an installed binary:
 
 ```sh
 CODEX_IDLE_COMPACT_TEST_CODEX="$(command -v codex)" \
   python3 -m unittest discover -s tests -v
 ```
 
-Audited locally on 2026-10-24: CLI **0.162.1**, desktop-bundled protocol **0.164.0-alpha.11.1**, and upstream source pinned in the research notes. Automatic compaction is intentionally unimplemented until the safety gap is closed. MIT licensed.
+The native test installs the actual plugin into a disposable home, trusts only that test fixture, creates a synthetic thread on an isolated server, and serves canned responses locally. It verifies automatic native compaction on that same server/thread, completion, and no repeat. No external inference or API key. CI tests Linux/macOS and Python 3.9/3.13.
+
+For socket/config diagnostics from a checkout: `python3 codex_idle_compact.py doctor`. A reachable socket is not proof that hooks in a particular session have been trusted or loaded. See [architecture](docs/architecture.md), [version-pinned research](docs/research.md), and [third-party license](vendor/LICENSE.websockets).

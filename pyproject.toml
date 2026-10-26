@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-idle-compact"
-version = "0.1.0"
-description = "Fail-closed idle-compaction observer for Codex; automatic compaction is blocked pending a safe native API"
+version = "0.2.0"
+description = "Automatic native idle compaction for daemon-backed Codex sessions"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
@@ -18,4 +18,4 @@ codex-idle-compact = "codex_idle_compact:main"
 Repository = "https://github.com/Winfred666/codex-idle-compact"
 
 [tool.setuptools]
-py-modules = ["codex_idle_compact"]
+py-modules = ["codex_idle_compact", "idle_plugin"]

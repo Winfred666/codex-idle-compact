@@ -1,25 +1,21 @@
 # Minimal architecture
 
 ```text
-Configured App Server client
-        ⇅ JSON-RPC lines
-Python observer (one event loop, thread-keyed in-memory state)
-        ⇅ native WebSocket-over-Unix-socket protocol
-Existing owning App Server / daemon
+Codex lifecycle hooks → private activity signals → one Python watcher
+                                                    ⇅ native WebSocket / Unix
+                                             same owning App Server
+                                                    ↓
+                                             thread/compact/start
 ```
 
-The companion owns no conversations and sends no additional RPCs. It does not inspect or modify transcripts. A per-endpoint `flock` prevents two companion instances; lock files contain no conversation data. Session state is keyed by `threadId`, not a potentially shared session-tree ID. This avoids mixing parent, fork, and subagent context.
+The hook checks the socket's kernel-reported peer PID against its ancestors. The watcher verifies that PID again on connection, initializes JSON-RPC, reads the already-loaded thread, and subscribes with `thread/resume`. It never invokes `thread/start`, starts Codex, reads a transcript, or injects UI input. Its subscription requests just the most recent turn's metadata and receives native usage/events. No database or network service is introduced.
 
-The observer accepts usage only for its currently observed turn. It requires an explicit completed turn and idle status in either notification order. A duplicate completion cannot reset the deadline or rearm a canceled report. The last model request's total includes its input and output; cumulative turn/session totals are not a context measurement. The event's effective window is used directly without applying the context-window reserve twice.
+`SessionStart` enrolls a session; `Stop` authorizes eligibility for its specific turn. `UserPromptSubmit`, `Interrupt`, `PreCompact`, `PostCompact` and `SessionEnd` invalidate it. A hook exits promptly after an atomic signal-file replacement; it never sleeps for the inactivity interval. Multiple events can collapse to the newest signal, conservatively skipping an opportunity. Native turn and activity events independently invalidate eligibility. Subagent turn IDs cannot authorize their parent's completed turn; separately identified child threads are not enrolled.
 
-Activity invalidates eligibility. Completion of a later turn is the only rearming path. Compaction items permanently exclude their turn, so native/manual compaction cannot recursively rearm the observer. Unknown JSON clears pending state while payloads are still relayed. EOF tears down the proxy and all timers; there is no reconnect or replay-based catch-up.
+The timer starts at a successful completion, with a matching Stop and effective usage. It uses the last response footprint of the current turn, not accumulated steps or lifetime usage. A late initial subscription starts its interval at observation, never backdates it. State is keyed by thread ID and verified owner, with an instance lock, per-thread in-flight lock, cooldown and one attempt per completed turn. New work is the only way to rearm. Timers are discarded on disconnection or sleep; there is no catch-up scan of old conversation files.
 
-The timer currently ends at a **blocked report**. Adding a call after the current predicate would be unsafe. A working automatic version needs a native owner-side operation that atomically:
+Preflight reads cover the queue, background terminals, active goals, descendants, latest turn and status. Hook activity and native event revisions are checked again immediately before sending the native compact request. Any failed read, busy state, pagination ambiguity or activity change skips that opportunity. A sent request requires a matching context-compaction item and completed turn; failure, timeout or disconnect cannot trigger a blind retry.
 
-1. Requires a still-loaded thread, the expected completed turn/context revision, idle status, no tool execution, no queued/automatic work, and an acceptable activity timestamp.
-2. Reserves compaction without replacing a turn that won the race; new input must be able to preempt background compaction safely.
-3. Returns an identifiable compaction operation/turn whose context-compaction item, successful completion, error, interruption, and disconnect can be correlated.
+**These checks are not atomic.** The public compact operation can replace a turn that begins between check and send. `thread/resume` also has no loaded-only precondition. Replace these with native guarded operations when available; do not infer stronger guarantees from the external locks. Unsubmitted typing is outside the available event stream.
 
-A passive, loaded-only subscription would also avoid the attach/unload race of using `thread/resume` merely to observe another client's session. Unsent composer activity needs a client signal; lifecycle hooks only observe submitted prompts.
-
-No speculative RPC name, undocumented guard parameter, or implementation hook is shipped. There is no model-assisted compaction fallback, terminal input injection, Codex fork, database, persistent daemon, or model-facing skill.
+Code: `idle_plugin.py` handles hooks/config/ownership and `codex_idle_compact.py` handles subscriptions, policy and native compaction. Bundled WebSocket code handles protocol framing; no custom protocol implementation. Plugin removal deletes its cached source, causing the watcher to exit; disabling hooks prevents fresh Stop authorizations, but an already-armed timer can remain until canceled or expired.

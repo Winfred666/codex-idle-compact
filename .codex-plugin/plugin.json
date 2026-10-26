@@ -1,0 +1,6 @@
+{
+  "name": "codex-idle-compact",
+  "version": "0.2.0",
+  "description": "Automatically compact idle Codex sessions above 40% context after 20 minutes.",
+  "hooks": "./hooks/hooks.json"
+}

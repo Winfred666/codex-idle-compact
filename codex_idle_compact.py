@@ -1,306 +1,431 @@
-"""Fail-closed idle-compaction observer for an existing Codex App Server."""
-
+"""Automatic idle compaction through the owning native Codex App Server."""
 import argparse
 import asyncio
 from dataclasses import dataclass
-import fcntl
-import hashlib
 import json
-import math
-import os
+import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-import stat
-import subprocess
 import sys
-import tempfile
 import time
 
-VERSION = "0.1.0"
-BLOCKER = ("Automatic compaction is unavailable: the audited native API can replace "
-           "an active turn and has no atomic idle/queue precondition.")
+from idle_plugin import hook, lock, owner_socket, private_directory, read_signal, settings
+
+VERSION = '0.2.0'
+wheel = Path(__file__).with_name('vendor') / 'websockets-15.0.1-py3-none-any.whl'
+if wheel.exists():
+    sys.path.insert(0, str(wheel))
+from websockets.asyncio.client import unix_connect
+from websockets.exceptions import WebSocketException
 
 
 def context_usage(value):
-    """Return (latest footprint, effective window), never lifetime totals."""
-    if not isinstance(value, dict) or not isinstance(value.get("last"), dict):
+    """Latest model-response footprint, never lifetime totals or duplicated cache tokens."""
+    if not isinstance(value, dict) or not isinstance(value.get('last'), dict):
         return None
-    last = value["last"]
-    fields = [last.get(k) for k in ("inputTokens", "outputTokens", "totalTokens")]
-    window = value.get("modelContextWindow")
+    last = value['last']
+    fields = [last.get(k) for k in ('inputTokens', 'outputTokens', 'totalTokens')]
+    window = value.get('modelContextWindow')
     if any(type(n) is not int or n < 0 for n in fields + [window]):
         return None
-    input_tokens, output_tokens, total = fields
-    if window == 0 or total != input_tokens + output_tokens or total > window:
+    inputs, outputs, total = fields
+    if window == 0 or total != inputs + outputs or total > window:
         return None
     return total, window
 
 
+class RpcError(Exception):
+    pass
+
+
+class RPC:
+    def __init__(self, connection, callback):
+        self.connection, self.callback = connection, callback
+        self.pending, self.serial = {}, 0
+        self.reader = asyncio.create_task(self.receive())
+
+    @classmethod
+    async def open(cls, path, owner_pid, callback):
+        sock, pid = owner_socket(path)
+        if pid != owner_pid:
+            sock.close()
+            raise RpcError('owning server changed')
+        try:
+            connection = await unix_connect(sock=sock, compression=None, open_timeout=5,
+                                            close_timeout=1, max_size=64 * 1024 * 1024)
+        except BaseException:
+            sock.close()
+            raise
+        rpc = cls(connection, callback)
+        try:
+            await rpc.call('initialize', {'clientInfo': {'name': 'codex_idle_compact', 'version': VERSION},
+                                         'capabilities': {'experimentalApi': True}})
+            await connection.send(json.dumps({'method': 'initialized', 'params': {}}))
+        except BaseException:
+            await rpc.close()
+            raise
+        return rpc
+
+    async def call(self, method, params):
+        self.serial += 1
+        request_id = self.serial
+        future = asyncio.get_running_loop().create_future()
+        self.pending[request_id] = future
+        try:
+            await self.connection.send(json.dumps({'id': request_id, 'method': method, 'params': params}))
+            return await asyncio.wait_for(future, 10)
+        finally:
+            self.pending.pop(request_id, None)
+
+    async def receive(self):
+        try:
+            async for payload in self.connection:
+                message = json.loads(payload)
+                if 'method' in message:
+                    self.callback(message)  # Never answer another client's approval requests.
+                elif message.get('id') in self.pending:
+                    future = self.pending[message['id']]
+                    if not future.done():
+                        if 'error' in message:
+                            future.set_exception(RpcError('RPC rejected'))
+                        else:
+                            future.set_result(message['result'])
+        finally:
+            for future in self.pending.values():
+                if not future.done():
+                    future.set_exception(RpcError('owner disconnected'))
+
+    async def close(self):
+        await self.connection.close()
+        self.reader.cancel()
+        await asyncio.gather(self.reader, return_exceptions=True)
+
+
 @dataclass
 class Session:
-    turn: str = ""
-    status: str = "unknown"
+    thread: str
+    owner: tuple
+    turn: str = ''
+    status: str = 'unknown'
     usage: object = None
-    complete: bool = False
+    usage_turn: str = ''
+    stop_turn: str = ''
+    finished: object = None
     ended: bool = False
     compacting: bool = False
-    finished: float = 0
-    deadline: object = None
     consumed: bool = False
+    locked: bool = False
     cooldown: float = 0
+    revision: int = 0
+    attempt: object = None
+    compact_turn: str = ''
+    compact_item: str = ''
+    item_completed: bool = False
 
     def cancel(self):
-        self.complete = False
-        self.deadline = None
+        self.stop_turn = ''
+        self.revision += 1
 
+    def ready(self, now, idle):
+        return (not self.locked and not self.consumed and not self.compacting
+                and self.status == 'idle' and self.ended and self.finished is not None
+                and self.stop_turn == self.turn and self.usage_turn == self.turn
+                and self.usage is not None and self.usage[0] * 100 >= self.usage[1] * 40
+                and now >= max(self.finished + idle, self.cooldown))
 
-class Observer:
-    """Observed candidates are reports only. This class cannot send RPCs."""
-
-    def __init__(self, idle_seconds=1200, clock=time.monotonic):
-        if not math.isfinite(idle_seconds) or idle_seconds <= 0:
-            raise ValueError("idle duration must be finite and positive")
-        self.idle = idle_seconds
-        self.clock = clock
-        self.sessions = {}
-
-    def message(self, message, client=False):
-        if not isinstance(message, dict):
+    def event(self, message, now):
+        method, p = message.get('method'), message.get('params', {})
+        if not isinstance(p, dict):
+            self.cancel()
             return
-        method = message.get("method", "")
-        params = message.get("params")
+        if method == 'turn/started':
+            turn = p['turn']['id']
+            if turn != self.turn:
+                self.turn, self.status, self.finished = turn, 'active', None
+                self.ended = self.compacting = self.consumed = False
+                self.usage, self.usage_turn = None, ''
+                self.cancel()
+        elif method == 'thread/tokenUsage/updated':
+            value, turn = context_usage(p.get('tokenUsage')), p.get('turnId')
+            if (self.usage, self.usage_turn) != (value, turn):
+                self.usage, self.usage_turn = value, turn
+                self.revision += 1
+        elif method == 'thread/status/changed':
+            self.status = p['status']['type']
+            if self.status != 'idle':
+                self.cancel()
+        elif method in {'thread/queue/changed', 'thread/settings/updated', 'thread/goal/updated'}:
+            self.cancel()
+        elif method in {'item/started', 'item/completed'}:
+            item = p.get('item', {})
+            if item.get('type') == 'contextCompaction':
+                self.compacting = True
+                self.cancel()
+                if self.attempt is not None:
+                    if method == 'item/started' and not self.compact_turn:
+                        self.compact_turn, self.compact_item = p.get('turnId'), item.get('id')
+                    if p.get('turnId') == self.compact_turn and item.get('id') == self.compact_item:
+                        self.item_completed = method == 'item/completed'
+            elif method == 'item/started':
+                self.cancel()
+        elif method == 'turn/completed':
+            turn = p['turn']
+            if any(item.get('type') == 'contextCompaction' for item in turn.get('items', [])):
+                self.compacting = True
+                self.cancel()
+            if self.attempt is not None and turn['id'] == self.compact_turn and not self.attempt.done():
+                self.attempt.set_result(turn['status'] == 'completed' and self.item_completed)
+            if turn['id'] == self.turn and not self.ended:
+                self.ended = True
+                self.finished = now
+                if turn['status'] != 'completed':
+                    self.cancel()
+        elif method == 'error':
+            self.cancel()
+            if self.attempt is not None and p.get('turnId') == self.compact_turn and not self.attempt.done():
+                self.attempt.set_result(False)
+        elif 'id' in message:  # A server request, including approval / user-input requests.
+            self.cancel()
+
+
+class Watcher:
+    def __init__(self, data, emit, clock=time.monotonic):
+        self.data, self.emit, self.clock = data, emit, clock
+        self.sessions, self.connections, self.signals, self.jobs = {}, {}, {}, set()
+        self.started = time.time_ns() - 5_000_000_000
+        self.idle = settings()[0]
+        self.hook_lock = asyncio.Lock()
+
+    def event(self, owner, message):
+        params = message.get('params', {})
         if not isinstance(params, dict):
             return
-        thread = params.get("threadId")
-        if not isinstance(thread, str) or not thread:
+        thread = params.get('threadId')
+        s = self.sessions.get(thread)
+        if s is None or s.owner != owner:
             return
-        if method in {"thread/closed", "thread/archived", "thread/deleted"}:
+        if message.get('method') in {'thread/closed', 'thread/archived', 'thread/deleted'}:
+            s.cancel()
             self.sessions.pop(thread, None)
             return
-        if client:
-            # Even a metadata read may reflect user activity; err on the quiet side.
-            if thread in self.sessions:
-                self.sessions[thread].cancel()
-            return
-        s = self.sessions.get(thread)
-        if method == "turn/started":
-            turn = params.get("turn")
-            if not isinstance(turn, dict) or not isinstance(turn.get("id"), str) or not turn["id"]:
-                return
-            if s is not None and s.turn == turn["id"]:
-                return
-            self.sessions[thread] = Session(
-                turn=turn["id"], status="active", cooldown=s.cooldown if s else 0)
-            return
-        # Never infer idle time or arm from a replayed historical snapshot.
-        if s is None:
-            return
-        if method == "thread/tokenUsage/updated" and params.get("turnId") == s.turn:
-            s.usage = context_usage(params.get("tokenUsage"))
-        elif method == "thread/status/changed":
-            status = params.get("status")
-            s.status = status.get("type", "unknown") if isinstance(status, dict) else "unknown"
-            if s.status != "idle":
-                s.cancel()
-        elif method == "thread/queue/changed":
+        try:
+            s.event(message, self.clock())
+        except (ValueError, TypeError, KeyError, AttributeError):
             s.cancel()
-        elif method in {"item/started", "item/completed"}:
-            if params.get("turnId") != s.turn:
-                return
-            item = params.get("item")
-            if isinstance(item, dict) and item.get("type") == "contextCompaction":
-                s.compacting = True
-                s.usage = None
-                s.cancel()
-            elif method == "item/started":
-                s.cancel()
-        elif method == "turn/completed":
-            turn = params.get("turn")
-            if not isinstance(turn, dict) or turn.get("id") != s.turn:
-                return
-            if s.ended:
-                return
-            s.ended = True
-            items = turn.get("items", [])
-            if not isinstance(items, list):
-                s.cancel()
-                return
-            s.compacting |= any(isinstance(i, dict) and i.get("type") == "contextCompaction"
-                                for i in items)
-            s.complete = turn.get("status") == "completed" and not s.compacting
-            s.finished = self.clock()
-        self._arm(s)
+            s.usage = None
 
-    def _arm(self, s):
-        if (s.complete and not s.compacting and not s.consumed and s.status == "idle"
-                and s.usage is not None and s.usage[0] * 100 >= s.usage[1] * 40):
-            s.deadline = max(s.finished + self.idle, s.cooldown)
-        else:
-            s.deadline = None
+    async def attach(self, signal):
+        thread = signal['threadId']
+        owner = signal['socket'], signal['ownerPid']
+        rpc = self.connections.get(owner)
+        if rpc is None:
+            rpc = await RPC.open(*owner, lambda message: self.event(owner, message))
+            self.connections[owner] = rpc
+        snapshot = (await rpc.call('thread/read', {'threadId': thread, 'includeTurns': False}))['thread']
+        if snapshot['id'] != thread or snapshot['status']['type'] == 'notLoaded' or snapshot.get('parentThreadId'):
+            raise RpcError('thread is not a loaded root on its verified owner')
+        s = Session(thread, owner)
+        self.sessions[thread] = s
+        # Called only after an owner-PID check and a loaded-thread read; never cold-resume a stored ID.
+        result = await rpc.call('thread/resume', {'threadId': thread, 'excludeTurns': True,
+                                'initialTurnsPage': {'limit': 1, 'itemsView': 'notLoaded'}})
+        if result['thread']['id'] != thread:
+            raise RpcError('thread identity changed')
+        s.status = result['thread']['status']['type']
+        turns = (result.get('initialTurnsPage') or {}).get('data', [])
+        if turns and not s.turn:
+            turn = turns[0]
+            s.turn = turn['id']
+            s.ended = turn['status'] == 'completed'
+            s.finished = self.clock() if s.ended else None
+        self.emit('watching', threadId=thread)
+        return s
 
-    def tick(self):
-        now = self.clock()
-        reports = []
-        for thread, s in self.sessions.items():
-            self._arm(s)
-            if s.deadline is None or now < s.deadline:
-                continue
-            late = now - s.deadline > 60
-            s.consumed = True
-            s.deadline = None
-            s.cooldown = now + self.idle
-            reports.append({"event": "skipped_late" if late else "blocked",
-                            "threadId": thread, "turnId": s.turn,
-                            "usedTokens": s.usage[0], "contextWindow": s.usage[1],
-                            "idleSeconds": round(now - s.finished, 3),
-                            "compactionStarted": False, "reason": BLOCKER})
-        return reports
+    async def refresh_hooks(self):
+        async with self.hook_lock:
+            await self.read_hooks()
 
+    async def read_hooks(self):
+        for path in (self.data / 'sessions').glob('*.json'):
+            signal = None
+            try:
+                signal = read_signal(path)
+                thread = signal['threadId']
+                if path.stem != thread:
+                    raise ValueError('signal filename mismatch')
+                if signal['stamp'] < self.started or self.signals.get(thread) == signal['stamp']:
+                    continue
+                self.signals[thread] = signal['stamp']
+                if signal['event'] == 'SessionEnd':
+                    s = self.sessions.pop(thread, None)
+                    if s is not None:
+                        s.cancel()
+                        await self.connections[s.owner].call('thread/unsubscribe', {'threadId': thread})
+                    continue
+                s = self.sessions.get(thread)
+                owner = signal['socket'], signal['ownerPid']
+                if s is not None and s.owner != owner:
+                    s.cancel()
+                    self.sessions.pop(thread, None)
+                    s = None
+                if s is None:
+                    s = await self.attach(signal)
+                if signal['event'] == 'Stop' and signal.get('turnId'):
+                    s.stop_turn = signal['turnId']
+                    s.revision += 1
+                elif signal['event'] != 'SessionStart':
+                    s.cancel()
+            except (OSError, ValueError, KeyError, TypeError, AttributeError, RpcError, WebSocketException, asyncio.TimeoutError):
+                s = self.sessions.pop(path.stem, None)
+                if s is not None:
+                    s.cancel()
+                self.emit('hook_unavailable')
 
-def log(value):
-    print(json.dumps(value, separators=(",", ":")), file=sys.stderr, flush=True)
-
-
-def validate_socket(path):
-    path = Path(path).expanduser().resolve()
-    if not stat.S_ISSOCK(path.stat().st_mode):
-        raise ValueError("--socket must identify an existing owning App Server socket")
-    return path
-
-
-def endpoint_lock(path):
-    """One observer per canonical endpoint; flock releases after a crash."""
-    directory = Path(tempfile.gettempdir()) / ("codex-idle-compact-" + str(os.getuid()))
-    directory.mkdir(mode=0o700, exist_ok=True)
-    info = directory.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-        raise ValueError("observer lock directory must be private and owned by this user")
-    name = hashlib.sha256(str(path).encode()).hexdigest() + ".lock"
-    fd = os.open(directory / name, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-    handle = os.fdopen(fd, "w")
-    try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BaseException:
-        handle.close()
-        raise
-    return handle
-
-
-async def relay(reader, write, observer, client):
-    while True:
-        line = await reader.readline()
-        if not line:
-            return
+    async def compact(self, s):
+        s.locked = s.consumed = True
+        revision, turn = s.revision, s.turn
+        rpc = self.connections[s.owner]
         try:
-            observer.message(json.loads(line), client=client)
-        except (ValueError, TypeError):
-            # Unknown input must not leave a previously armed report behind.
-            observer.sessions.clear()
-        await write(line)
-
-
-async def proxy(args):
-    from websockets.asyncio.client import unix_connect
-    from websockets.exceptions import WebSocketException
-
-    path = validate_socket(args.socket)
-    with endpoint_lock(path):
-        observer = Observer(args.idle_minutes * 60)
-        transport = None
-        tasks = []
-        try:
-            # Codex's Unix listener uses WebSocket frames, not JSONL socket bytes.
-            async with unix_connect(str(path), compression=None, max_size=64 * 1024 * 1024,
-                                    open_timeout=10, close_timeout=2) as connection:
-                log({"event": "observer_started", "automaticCompaction": False, "reason": BLOCKER})
-                reader = asyncio.StreamReader(limit=64 * 1024 * 1024)
-                transport, _ = await asyncio.get_running_loop().connect_read_pipe(
-                    lambda: asyncio.StreamReaderProtocol(reader), sys.stdin.buffer)
-
-                async def to_server(line):
-                    await connection.send(line.decode("utf-8").removesuffix("\n"))
-
-                async def from_server():
-                    async for payload in connection:
-                        if not isinstance(payload, str):
-                            raise ValueError("expected a JSON text frame")
-                        try:
-                            observer.message(json.loads(payload))
-                        except (ValueError, TypeError):
-                            observer.sessions.clear()
-                        sys.stdout.buffer.write(payload.encode("utf-8") + b"\n")
-                        sys.stdout.buffer.flush()
-
-                async def timer():
-                    while True:
-                        await asyncio.sleep(min(1, observer.idle))
-                        for report in observer.tick():
-                            log(report)
-
-                tasks = [asyncio.create_task(relay(reader, to_server, observer, True)),
-                         asyncio.create_task(from_server()), asyncio.create_task(timer())]
-                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                for task in done:
-                    task.result()
-        except WebSocketException as error:
-            raise ValueError("owner WebSocket connection failed") from error
+            queue = await rpc.call('thread/queue/list', {'threadId': s.thread, 'limit': 1})
+            terminals = await rpc.call('thread/backgroundTerminals/list', {'threadId': s.thread, 'limit': 1})
+            goal = (await rpc.call('thread/goal/get', {'threadId': s.thread}))['goal']
+            # The API defaults to interactive sources and the current provider, hiding subagents.
+            descendants = await rpc.call('thread/list', {'ancestorThreadId': s.thread, 'limit': 100,
+                'sourceKinds': ['cli', 'vscode', 'exec', 'appServer', 'subAgent', 'unknown'],
+                'modelProviders': []})
+            turns = await rpc.call('thread/turns/list', {'threadId': s.thread, 'limit': 1, 'itemsView': 'notLoaded'})
+            snapshot = (await rpc.call('thread/read', {'threadId': s.thread, 'includeTurns': False}))['thread']
+            await self.refresh_hooks()
+            latest = turns['data'][0]
+            if (queue['data'] or queue.get('nextCursor') or terminals['data'] or terminals.get('nextCursor')
+                    or (goal is not None and goal.get('status') not in {'complete', 'paused', 'blocked', 'budgetLimited', 'usageLimited'})
+                    or descendants.get('nextCursor')
+                    or any(t['status']['type'] not in {'idle', 'notLoaded'} for t in descendants['data'])
+                    or latest['id'] != turn or latest['status'] != 'completed'
+                    or snapshot['id'] != s.thread or snapshot['status']['type'] != 'idle'
+                    or s.revision != revision or self.sessions.get(s.thread) is not s
+                    or s.status != 'idle' or s.stop_turn != turn or s.usage_turn != turn
+                    or s.usage is None or s.usage[0] * 100 < s.usage[1] * 40
+                    or s.finished is None or self.clock() - s.finished < self.idle):
+                self.emit('skipped_busy_or_changed', threadId=s.thread)
+                return
+            s.attempt = asyncio.get_running_loop().create_future()
+            s.compact_turn, s.compact_item, s.item_completed = '', '', False
+            s.cooldown = self.clock() + self.idle
+            # shortcut: the native API has no atomic idle guard; replace this check-and-send when one exists.
+            await rpc.call('thread/compact/start', {'threadId': s.thread})
+            self.emit('compaction_started', threadId=s.thread, previousTurnId=turn)
+            result = await asyncio.wait_for(s.attempt, 180)
+            self.emit('compaction_completed' if result else 'compaction_failed', threadId=s.thread)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError, RpcError, WebSocketException, asyncio.TimeoutError):
+            self.emit('compaction_unconfirmed' if s.attempt is not None else 'preflight_unavailable', threadId=s.thread)
         finally:
-            for task in tasks:
+            if s.attempt is not None and not s.attempt.done():
+                s.attempt.cancel()
+            s.attempt = None
+            s.locked = False
+            # A missing response is not grounds to retry an operation that may have executed.
+            if s.turn in {turn, s.compact_turn}:
+                s.consumed = True
+
+    async def run(self):
+        last_wall, last_mono = time.time(), self.clock()
+        empty_since = self.clock()
+        try:
+            while Path(__file__).exists():
+                await self.refresh_hooks()
+                try:
+                    self.idle = settings()[0]
+                except (OSError, ValueError, TypeError):
+                    for s in self.sessions.values():
+                        s.cancel()
+                    await asyncio.sleep(1)
+                    continue
+                now, wall = self.clock(), time.time()
+                if wall - last_wall > 60 or now - last_mono > 60:
+                    for s in self.sessions.values():
+                        s.cancel()
+                    self.emit('skipped_sleep_or_delay')
+                last_wall, last_mono = wall, now
+                for owner, rpc in list(self.connections.items()):
+                    if rpc.reader.done():
+                        for thread, s in list(self.sessions.items()):
+                            if s.owner == owner:
+                                s.cancel()
+                                if s.attempt is not None and not s.attempt.done():
+                                    s.attempt.set_exception(RpcError('owner disconnected'))
+                                self.sessions.pop(thread)
+                        await rpc.close()
+                        self.connections.pop(owner)
+                        self.emit('owner_disconnected')
+                for s in list(self.sessions.values()):
+                    if s.ready(now, self.idle):
+                        s.locked = True
+                        task = asyncio.create_task(self.compact(s))
+                        self.jobs.add(task)
+                        task.add_done_callback(self.jobs.discard)
+                if self.sessions or self.jobs:
+                    empty_since = now
+                elif now - empty_since > 5:
+                    return
+                await asyncio.sleep(0.25)
+        finally:
+            for task in self.jobs:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            if transport is not None:
-                transport.close()
-        return 0
+            await asyncio.gather(*self.jobs, return_exceptions=True)
+            for rpc in self.connections.values():
+                await rpc.close()
 
 
-def doctor(args):
-    version = subprocess.run([args.codex, "--version"], capture_output=True,
-                             text=True, check=True, timeout=15).stdout.strip()
-    with tempfile.TemporaryDirectory(prefix="codex-idle-schema-") as directory:
-        subprocess.run([args.codex, "app-server", "generate-json-schema", "--experimental",
-                        "--out", directory], capture_output=True, check=True, timeout=30)
-        schema = json.loads((Path(directory) / "v2/ThreadCompactStartParams.json").read_text())
-    fields = sorted(schema.get("properties", {}))
-    result = {"cliVersion": version, "compactRequestFields": fields,
-              "automaticCompaction": False, "reason": BLOCKER if fields == ["threadId"]
-              else "Unreviewed protocol: atomic idle safety has not been verified."}
-    if args.socket:
-        result["socketExists"] = validate_socket(args.socket).exists()
-    print(json.dumps(result, indent=2))
-    return 2
-
-
-def minutes(value):
+def run_watcher(data):
+    data = private_directory(data)
     try:
-        number = float(value)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError("minutes must be a number") from error
-    if not math.isfinite(number) or number <= 0:
-        raise argparse.ArgumentTypeError("minutes must be finite and greater than zero")
-    return number
+        handle = lock(data / 'watcher.lock')
+    except BlockingIOError:
+        return 0
+    with handle:
+        logger = logging.getLogger('codex-idle-compact')
+        logger.setLevel(logging.INFO)
+        handler = RotatingFileHandler(data / 'watcher.log', maxBytes=262144, backupCount=1)
+        logger.addHandler(handler)
+        def emit(event, **fields):
+            logger.info(json.dumps({'event': event, **fields}))
+        try:
+            asyncio.run(Watcher(data, emit).run())
+        finally:
+            logger.removeHandler(handler)
+            handler.close()
+    return 0
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", action="version", version=VERSION)
-    commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("doctor", "proxy"):
-        command = commands.add_parser(name)
-        if name == "doctor":
-            command.add_argument("--codex", default="codex", help="native Codex executable")
-        command.add_argument("--socket", required=name == "proxy", help="existing owner socket")
-        if name == "proxy":
-            command.add_argument("--idle-minutes", type=minutes, default=20)
+    parser.add_argument('--version', action='version', version=VERSION)
+    commands = parser.add_subparsers(dest='command', required=True)
+    commands.add_parser('hook')
+    commands.add_parser('doctor')
+    watch = commands.add_parser('watch')
+    watch.add_argument('--data', type=Path, required=True)
     args = parser.parse_args(argv)
+    if args.command == 'hook':
+        print(json.dumps(hook()))
+        return 0
     try:
-        return doctor(args) if args.command == "doctor" else asyncio.run(proxy(args))
-    except (OSError, ValueError, ImportError, subprocess.SubprocessError) as error:
-        # Never dump protocol messages, prompts, environment, or subprocess output.
-        log({"event": "unavailable", "errorType": type(error).__name__,
-             "reason": "Check installed dependencies, the executable, owner socket, and observer lock."})
+        if args.command == 'doctor':
+            idle, endpoint = settings()
+            sock, pid = owner_socket(endpoint)
+            sock.close()
+            print(json.dumps({'defaultEnabled': True, 'daemonReachable': True, 'idleMinutes': idle / 60,
+                              'socket': str(endpoint), 'ownerPid': pid,
+                              'note': 'Requires trusted plugin hooks in a new daemon-backed session; idle checks are best effort.'}, indent=2))
+            return 0
+        return run_watcher(args.data)
+    except (OSError, ValueError, KeyError, TypeError, WebSocketException):
+        print('codex-idle-compact: configuration or owning daemon unavailable; no session was started or restarted.', file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         return 130
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     sys.exit(main())
