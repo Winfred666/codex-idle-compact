@@ -2,11 +2,13 @@
 
 [![CI](https://github.com/Winfred666/codex-idle-compact/actions/workflows/ci.yml/badge.svg)](https://github.com/Winfred666/codex-idle-compact/actions/workflows/ci.yml)
 
-**Status: observer preview. Automatic compaction is unavailable on the audited Codex runtimes.**
+**Status: incomplete observer preview. This implementation deliberately disables automatic compaction.**
 
 The intended behavior is native compaction after a completed turn, at least **40% active context**, and **20 minutes of inactivity**. Research found a blocking race: Codex's `thread/compact/start` can abort an active turn, and accepts no atomic idle precondition. Checking status just before calling it cannot guarantee that new work is safe.
 
-This release therefore ships a working, fail-closed local companion: a runtime diagnostic and an idle observer for an existing App Server connection. **It never initiates compaction.** There is no unsafe enable switch. See [verified findings](docs/research.md) and [architecture](docs/architecture.md).
+This release ships a runtime diagnostic and an idle observer for an existing App Server connection. **It never initiates compaction because the trigger was not implemented.** Codex does expose native compaction; this project's original strict requirement to never interrupt active work cannot be guaranteed by an external idle check followed by that call. The observer does not fulfill the automatic-compaction goal. See [verified findings](docs/research.md) and [architecture](docs/architecture.md).
+
+Installing this Python package also does not register lifecycle hooks or start a watcher. There is no automatic enable switch in this preview. An enabled-by-default plugin would need startup integration plus either best-effort idle checks with a remaining interruption race, or a native guarded-compaction operation. Plugin hooks additionally require Codex's normal trust review.
 
 ## Install
 
@@ -52,7 +54,7 @@ The socket must already belong to the server owning the target threads. The comp
 
 The usual shared-daemon socket is `$CODEX_HOME/app-server-control/app-server-control.sock` (`~/.codex` is the default home); long paths may be relocated by Codex. Use the actual owner socket. Do not start another server to load a desktop chat for this purpose.
 
-**This is not a drop-in installation for Codex Desktop or the stock TUI.** It observes only the threads already subscribed on the connection routed through it. An already-running stdio-only desktop session cannot be attached this way. Hooks cannot supply the missing atomic operation, so this preview does not install a plugin, hooks, or global configuration.
+**This preview has no drop-in Desktop/TUI integration.** That is partly an implementation limitation: a stock TUI connected to a shared daemon can expose its owning server, but this preview has no independent watcher/subscription bootstrap for it. The proxy observes only threads already subscribed on the client connection routed through it. An embedded or already-running stdio-only server does not expose an attachable Unix endpoint. Hooks can help start a watcher and report submitted activity, but cannot supply the missing atomic compaction guard. This preview does not install a plugin, hooks, or global configuration.
 
 For SSH, install and run the companion on the runtime host, with that host's owner socket. A configurable local client can launch it through `ssh host codex-idle-compact proxy --socket ...`. Do not expose an unauthenticated network listener.
 

@@ -2,7 +2,9 @@
 
 Inspected 2026-10-24 before implementation. Release source: [`rust-v0.162.1`, commit `7a078f6`](https://github.com/openai/codex/tree/7a078f6bb4ce0dc2a81408b334ce52979d92c603). Also checked upstream [`970111f`](https://github.com/openai/codex/tree/970111f6cb62cc02fe36a82ea7d71b37a2889c97). Findings are version-specific, not a promise about future releases.
 
-## Why automatic compaction is blocked
+## Why this implementation disables automatic compaction
+
+Clarification, 2026-10-25: native compaction is available. The missing guarantee is an atomic idle-only operation. The current repository omits the trigger and startup integration; it is an incomplete implementation of the requested product, not evidence that all Codex automation or stock TUI attachment is impossible. A daemon-backed TUI can expose its owning server. Embedded/stdio-only servers and the strict no-interruption requirement remain separate limitations. Rechecking installed versions and upstream HEAD found no change to the inspected compaction request or core handler.
 
 The released [`ThreadCompactStartParams`](https://github.com/openai/codex/blob/7a078f6bb4ce0dc2a81408b334ce52979d92c603/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L1164) contains only `thread_id`. The [request handler](https://github.com/openai/codex/blob/7a078f6bb4ce0dc2a81408b334ce52979d92c603/codex-rs/app-server/src/request_processors/thread_processor.rs#L2368) looks up a loaded thread and submits `Op::Compact`. The [core handler](https://github.com/openai/codex/blob/7a078f6bb4ce0dc2a81408b334ce52979d92c603/codex-rs/core/src/session/handlers.rs#L247) calls `abort_all_tasks(TurnAbortReason::Replaced)` before starting the compaction task.
 
