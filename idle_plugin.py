@@ -80,6 +80,7 @@ def ancestors():
     result = set()
     while pid > 1 and pid not in result:
         result.add(pid)
+        yield pid
         if sys.platform.startswith('linux'):
             raw = Path('/proc/{}/stat'.format(pid)).read_text()
             pid = int(raw.rsplit(')', 1)[1].split()[1])
@@ -87,7 +88,6 @@ def ancestors():
             raw = subprocess.run(['ps', '-o', 'ppid=', '-p', str(pid)], capture_output=True,
                                  text=True, check=True, timeout=1).stdout.strip()
             pid = int(raw)
-    return result
 
 
 def read_signal(path):
@@ -148,3 +148,7 @@ def hook():
         if isinstance(payload, dict) and payload.get('hook_event_name') == 'SessionStart':
             return {'systemMessage': 'codex-idle-compact: this session has no verified owning daemon socket or valid plugin configuration. Start a new daemon-backed Codex session to enable idle compaction. No session was restarted. See the plugin README.'}
         return {}
+
+
+if __name__ == '__main__':
+    print(json.dumps(hook()))

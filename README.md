@@ -37,7 +37,7 @@ codex plugin remove codex-idle-compact@codex-idle-compact
 
 ## What runs
 
-1. A trusted hook records only session/turn identifiers and activity. It starts one watcher, protected by an OS process lock.
+1. A trusted hook records only session/turn identifiers and activity. It starts one watcher, protected by an OS process lock. Hooks run on session, prompt, turn-stop, interrupt and compaction events; seeing a hook during active work does not mean compaction was requested. The hook uses a lightweight entry point that does not import the watcher's WebSocket stack, and retains a three-second timeout.
 2. The watcher attaches to the same loaded session on its verified owning daemon. A matching `Stop` hook, successful `turn/completed`, and native `idle` status are all required.
 3. It calculates `tokenUsage.last.totalTokens / tokenUsage.modelContextWindow`. Lifetime totals are ignored; cached/reasoning tokens are not added twice. Missing, inconsistent, or ambiguous usage disarms the timer.
 4. Submitted user input, new turns, tools, queue changes, compaction, session closure, or disconnect cancel eligibility. Native/manual compaction never rearms itself; a new normal completed turn is required.
@@ -67,6 +67,6 @@ CODEX_IDLE_COMPACT_TEST_CODEX="$(command -v codex)" \
   python3 -m unittest discover -s tests -v
 ```
 
-The native test installs the actual plugin into a disposable home, trusts only that test fixture, creates a synthetic thread on an isolated server, and serves canned responses locally. It verifies automatic native compaction on that same server/thread, completion, and no repeat. No external inference or API key. CI tests Linux/macOS and Python 3.9/3.13.
+The native tests install the actual plugin into a disposable home, trust only that test fixture, create synthetic threads on isolated servers, and serve canned responses locally. They verify automatic native compaction on the same server/thread, completion, and no repeat, plus no compaction while a new turn stays active for three idle intervals. Hook tests execute all seven installed commands against a verified socket owner within their configured budgets, without importing watcher dependencies. No external inference or API key. CI tests Linux/macOS and Python 3.9/3.13.
 
 For socket/config diagnostics from a checkout: `python3 codex_idle_compact.py doctor`. A reachable socket is not proof that hooks in a particular session have been trusted or loaded. See [architecture](docs/architecture.md), [version-pinned research](docs/research.md), and [third-party license](vendor/LICENSE.websockets).
