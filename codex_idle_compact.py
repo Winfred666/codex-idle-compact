@@ -11,7 +11,7 @@ import time
 
 from idle_plugin import hook, lock, owner_socket, private_directory, read_signal, settings
 
-VERSION = '0.2.0'
+VERSION = '0.2.1'
 wheel = Path(__file__).with_name('vendor') / 'websockets-15.0.1-py3-none-any.whl'
 if wheel.exists():
     sys.path.insert(0, str(wheel))
